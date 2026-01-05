@@ -54,6 +54,7 @@ class DownloadFallbackTest(unittest.TestCase):
                     fallback_cache,
                     fake_fetcher,
                     fake_downloader,
+                    None,
                 )
             )
 
@@ -77,11 +78,33 @@ class DownloadFallbackTest(unittest.TestCase):
                 captures,
                 fallback_cache,
                 fake_fetcher,
+                None,
             )
 
         self.assertEqual(timestamps, [])
         self.assertIn(original, fallback_cache)
         self.assertEqual(fallback_cache[original], [])
+
+    def test_get_timestamps_respects_cutoff(self):
+        original = "http://hokusetsu-ikimono.com/example2.jpg"
+        captures = {
+            original: [
+                "20110101000000",
+                "20101201000000",
+                "20101130000000",
+            ]
+        }
+        fallback_cache = {}
+
+        timestamps = archive_wayback.get_timestamps_for_url(
+            original,
+            captures,
+            fallback_cache,
+            None,
+            "20101201000000",
+        )
+
+        self.assertEqual(timestamps, ["20101130000000"])
 
 
 if __name__ == "__main__":

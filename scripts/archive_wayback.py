@@ -17,6 +17,7 @@ CDX_ENDPOINT = "https://web.archive.org/cdx/search/cdx"
 WAYBACK_PREFIX = "https://web.archive.org/web/"
 DEFAULT_DOMAIN = "www.hokusetsu-ikimono.com"
 USER_AGENT = "hokusetsu-ikimono-archiver/1.0 (+https://web.archive.org)"
+DEFAULT_STATE_DIR = "scripts/.archive_state"
 RETRY_COUNT = 3
 RETRY_DELAY_SECONDS = 5
 RETRY_ERRNOS = {61, 111, 10061}
@@ -41,8 +42,8 @@ def parse_args():
     )
     parser.add_argument(
         "--state-dir",
-        default="scripts/.archive_state",
-        help="Directory for resume state files (default: %(default)s)",
+        default=DEFAULT_STATE_DIR,
+        help="Base directory for resume state files (default: %(default)s)",
     )
     parser.add_argument(
         "--refresh-cdx",
@@ -66,6 +67,14 @@ def parse_args():
         action="store_true",
         help="Skip URLs recorded as failed in a previous run",
     )
+    parser.add_argument(
+        "--before",
+        default="",
+        help=(
+            "Only download snapshots before this date "
+            "(YYYY-MM-DD, YYYYMMDD, YYYY-MM, or YYYYMM)"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -79,6 +88,111 @@ def load_lines(path):
 def append_line(path, line):
     with path.open("a", encoding="utf-8") as handle:
         handle.write(line + "\n")
+
+
+def state_key_for_domain(domain):
+    value = domain.strip()
+    if not value:
+        return "unknown"
+    if "://" in value:
+        parsed = urllib.parse.urlsplit(value)
+    else:
+        parsed = urllib.parse.urlsplit(f"http://{value}")
+    host = parsed.hostname or value
+    path = parsed.path or ""
+    if path in ("", "/"):
+        key = host
+    else:
+        key = host + path
+    key = key.strip("/")
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", key)
+
+
+def load_state_marker(state_dir):
+    marker_path = state_dir / "state.json"
+    if not marker_path.exists():
+        return None
+    try:
+        with marker_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data.get("domain")
+
+
+def write_state_marker(state_dir, domain):
+    marker_path = state_dir / "state.json"
+    if marker_path.exists():
+        return
+    data = {"domain": domain}
+    with marker_path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=True, indent=2)
+        handle.write("\n")
+
+
+def infer_domain_from_cdx(cache_path):
+    if not cache_path.exists():
+        return None
+    try:
+        with cache_path.open("r", encoding="utf-8") as handle:
+            rows = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not rows or not isinstance(rows, list):
+        return None
+    header = rows[0]
+    if not isinstance(header, list):
+        return None
+    try:
+        original_index = header.index("original")
+    except ValueError:
+        return None
+    for row in rows[1:]:
+        if isinstance(row, list) and len(row) > original_index:
+            original = row[original_index]
+            parsed = urllib.parse.urlsplit(original)
+            if parsed.hostname:
+                return parsed.hostname
+    return None
+
+
+def resolve_state_dir(base_dir, domain):
+    base_dir = Path(base_dir)
+    domain_key = state_key_for_domain(domain)
+    candidate = base_dir / domain_key
+    marker_domain = load_state_marker(base_dir)
+    if marker_domain:
+        if state_key_for_domain(marker_domain) == domain_key:
+            return base_dir
+        return candidate
+    if candidate.exists():
+        return candidate
+    inferred = infer_domain_from_cdx(base_dir / "cdx_cache.json")
+    if inferred and state_key_for_domain(inferred) == domain_key:
+        return base_dir
+    return candidate
+
+
+def parse_before_date(value):
+    value = value.strip()
+    if not value:
+        return None
+    formats = ("%Y-%m-%d", "%Y%m%d", "%Y-%m", "%Y%m")
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(value, fmt)
+            if fmt in ("%Y-%m", "%Y%m"):
+                parsed = parsed.replace(day=1)
+            return parsed.strftime("%Y%m%d000000")
+        except ValueError:
+            continue
+    raise ValueError(f"Unsupported date format: {value}")
+
+
+def filter_timestamps(timestamps, cutoff):
+    if not cutoff:
+        return timestamps
+    return [timestamp for timestamp in timestamps if timestamp < cutoff]
 
 
 def extract_errno_from_text(text):
@@ -165,7 +279,7 @@ def fetch_cdx_rows_for_original(original_url):
     return json.loads(raw.decode("utf-8"))
 
 
-def build_capture_map(rows):
+def build_capture_map(rows, cutoff=None):
     if not rows:
         return {}
     header = rows[0]
@@ -181,6 +295,8 @@ def build_capture_map(rows):
             continue
         timestamp = row[ts_index]
         original = row[original_index]
+        if cutoff and timestamp >= cutoff:
+            continue
         captures.setdefault(original, []).append(timestamp)
 
     for timestamps in captures.values():
@@ -188,7 +304,7 @@ def build_capture_map(rows):
     return captures
 
 
-def extract_timestamps(rows):
+def extract_timestamps(rows, cutoff=None):
     if not rows:
         return []
     header = rows[0]
@@ -200,6 +316,7 @@ def extract_timestamps(rows):
     for row in rows[1:]:
         if len(row) > ts_index:
             timestamps.append(row[ts_index])
+    timestamps = filter_timestamps(timestamps, cutoff)
     timestamps.sort(reverse=True)
     return timestamps
 
@@ -282,11 +399,11 @@ def iter_candidate_urls(original_url):
             yield candidate
 
 
-def get_timestamps_for_url(original_url, captures, fallback_cache, fetcher):
+def get_timestamps_for_url(original_url, captures, fallback_cache, fetcher, cutoff):
     if original_url in captures:
-        return captures[original_url]
+        return filter_timestamps(captures[original_url], cutoff)
     if original_url in fallback_cache:
-        return fallback_cache[original_url]
+        return filter_timestamps(fallback_cache[original_url], cutoff)
     if fetcher is None:
         return []
     try:
@@ -298,14 +415,16 @@ def get_timestamps_for_url(original_url, captures, fallback_cache, fetcher):
         )
         fallback_cache[original_url] = []
         return []
-    timestamps = extract_timestamps(rows)
+    timestamps = extract_timestamps(rows, cutoff)
     fallback_cache[original_url] = timestamps
     return timestamps
 
 
-def select_metadata_candidate(original_url, captures, fallback_cache, fetcher):
+def select_metadata_candidate(original_url, captures, fallback_cache, fetcher, cutoff):
     for candidate in iter_candidate_urls(original_url):
-        timestamps = get_timestamps_for_url(candidate, captures, fallback_cache, fetcher)
+        timestamps = get_timestamps_for_url(
+            candidate, captures, fallback_cache, fetcher, cutoff
+        )
         if timestamps:
             return candidate, timestamps[0]
     return None, None
@@ -318,10 +437,13 @@ def download_with_fallback(
     fallback_cache,
     fetcher,
     downloader,
+    cutoff,
 ):
     last_error = ""
     for candidate in iter_candidate_urls(original_url):
-        timestamps = get_timestamps_for_url(candidate, captures, fallback_cache, fetcher)
+        timestamps = get_timestamps_for_url(
+            candidate, captures, fallback_cache, fetcher, cutoff
+        )
         for timestamp in timestamps:
             archive_url = f"{WAYBACK_PREFIX}{timestamp}id_/{candidate}"
             try:
@@ -385,9 +507,11 @@ def timestamp_to_date(timestamp):
 
 def main():
     args = parse_args()
+    cutoff = parse_before_date(args.before)
     output_dir = Path(args.output)
-    state_dir = Path(args.state_dir)
+    state_dir = resolve_state_dir(args.state_dir, args.domain)
     state_dir.mkdir(parents=True, exist_ok=True)
+    write_state_marker(state_dir, args.domain)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     downloaded_path = state_dir / "downloaded.txt"
@@ -398,7 +522,7 @@ def main():
     failed = load_lines(failed_path)
 
     rows = fetch_cdx_rows(args.domain, cdx_cache_path, refresh=args.refresh_cdx)
-    captures = build_capture_map(rows)
+    captures = build_capture_map(rows, cutoff=cutoff)
     fallback_cache = {}
 
     originals = sorted(captures.keys())
@@ -414,7 +538,11 @@ def main():
         if already_downloaded and dest_path.exists() and dest_path.stat().st_size > 0:
             if not meta_path.exists():
                 candidate_url, timestamp = select_metadata_candidate(
-                    original, captures, fallback_cache, fetch_cdx_rows_for_original
+                    original,
+                    captures,
+                    fallback_cache,
+                    fetch_cdx_rows_for_original,
+                    cutoff,
                 )
                 archive_url = (
                     f"{WAYBACK_PREFIX}{timestamp}id_/{candidate_url}"
@@ -445,7 +573,11 @@ def main():
         if dest_path.exists() and dest_path.stat().st_size > 0:
             if not meta_path.exists():
                 candidate_url, timestamp = select_metadata_candidate(
-                    original, captures, fallback_cache, fetch_cdx_rows_for_original
+                    original,
+                    captures,
+                    fallback_cache,
+                    fetch_cdx_rows_for_original,
+                    cutoff,
                 )
                 archive_url = (
                     f"{WAYBACK_PREFIX}{timestamp}id_/{candidate_url}"
@@ -481,6 +613,7 @@ def main():
                 fallback_cache,
                 fetch_cdx_rows_for_original,
                 download_capture,
+                cutoff,
             )
         )
 
